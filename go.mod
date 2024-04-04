@@ -1,4 +1,4 @@
-module github.com/phinexdaz/ipapk
+module github.com/362228416/ipapk
 
 go 1.21.4
 
