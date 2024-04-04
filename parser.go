@@ -5,6 +5,10 @@ import (
 	"bytes"
 	"encoding/xml"
 	"errors"
+	"github.com/andrianbdn/iospng"
+	"github.com/shogo82148/androidbinary"
+	"github.com/shogo82148/androidbinary/apk"
+	"howett.net/plist"
 	"image"
 	"image/png"
 	"io/ioutil"
@@ -12,11 +16,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-
-	"github.com/DHowett/go-plist"
-	"github.com/andrianbdn/iospng"
-	"github.com/shogo82148/androidbinary"
-	"github.com/shogo82148/androidbinary/apk"
 )
 
 var (

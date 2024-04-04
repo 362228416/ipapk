@@ -6,15 +6,56 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"reflect"
 )
 
 // XMLFile is an XML file expressed in binary format.
 type XMLFile struct {
 	stringPool     *ResStringPool
-	resourceMap    []uint32
 	notPrecessedNS map[ResStringPoolRef]ResStringPoolRef
-	namespaces     map[ResStringPoolRef]ResStringPoolRef
+	namespaces     xmlNamespaces
 	xmlBuffer      bytes.Buffer
+}
+
+type InvalidReferenceError struct {
+	Ref ResStringPoolRef
+}
+
+func (e *InvalidReferenceError) Error() string {
+	return fmt.Sprintf("androidbinary: invalid reference: 0x%08X", e.Ref)
+}
+
+type (
+	xmlNamespaces struct {
+		l []namespaceVal
+	}
+	namespaceVal struct {
+		key   ResStringPoolRef
+		value ResStringPoolRef
+	}
+)
+
+func (x *xmlNamespaces) add(key ResStringPoolRef, value ResStringPoolRef) {
+	x.l = append(x.l, namespaceVal{key: key, value: value})
+}
+
+func (x *xmlNamespaces) remove(key ResStringPoolRef) {
+	for i := len(x.l) - 1; i >= 0; i-- {
+		if x.l[i].key == key {
+			var newList = append(x.l[:i], x.l[i+1:]...)
+			x.l = newList
+			return
+		}
+	}
+}
+
+func (x *xmlNamespaces) get(key ResStringPoolRef) ResStringPoolRef {
+	for i := len(x.l) - 1; i >= 0; i-- {
+		if x.l[i].key == key {
+			return x.l[i].value
+		}
+	}
+	return ResStringPoolRef(0)
 }
 
 // ResXMLTreeNode is basic XML tree node.
@@ -83,18 +124,35 @@ func (f *XMLFile) Reader() *bytes.Reader {
 	return bytes.NewReader(f.xmlBuffer.Bytes())
 }
 
+// Decode decodes XML file and stores the result in the value pointed to by v.
+// To resolve the resource references, Decode also stores default TableFile and ResTableConfig in the value pointed to by v.
+func (f *XMLFile) Decode(v interface{}, table *TableFile, config *ResTableConfig) error {
+	decoder := xml.NewDecoder(f.Reader())
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+	inject(reflect.ValueOf(v), table, config)
+	return nil
+}
+
 func (f *XMLFile) readChunk(r io.ReaderAt, offset int64) (*ResChunkHeader, error) {
 	sr := io.NewSectionReader(r, offset, 1<<63-1-offset)
 	chunkHeader := &ResChunkHeader{}
-	if _, err := sr.Seek(0, seekStart); err != nil {
+	if _, err := sr.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	if err := binary.Read(sr, binary.LittleEndian, chunkHeader); err != nil {
 		return nil, err
 	}
+	if chunkHeader.HeaderSize < uint16(binary.Size(chunkHeader)) {
+		return nil, fmt.Errorf("androidbinary: invalid chunk header size: %d", chunkHeader.HeaderSize)
+	}
+	if chunkHeader.Size < uint32(chunkHeader.HeaderSize) {
+		return nil, fmt.Errorf("androidbinary: invalid chunk size: %d", chunkHeader.Size)
+	}
 
 	var err error
-	if _, err := sr.Seek(0, seekStart); err != nil {
+	if _, err := sr.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	switch chunkHeader.Type {
@@ -117,8 +175,13 @@ func (f *XMLFile) readChunk(r io.ReaderAt, offset int64) (*ResChunkHeader, error
 }
 
 // GetString returns a string referenced by ref.
+// It panics if the pool doesn't contain ref.
 func (f *XMLFile) GetString(ref ResStringPoolRef) string {
 	return f.stringPool.GetString(ref)
+}
+
+func (f *XMLFile) HasString(ref ResStringPoolRef) bool {
+	return f.stringPool.HasString(ref)
 }
 
 func (f *XMLFile) readStartNamespace(sr *io.SectionReader) error {
@@ -127,7 +190,7 @@ func (f *XMLFile) readStartNamespace(sr *io.SectionReader) error {
 		return err
 	}
 
-	if _, err := sr.Seek(int64(header.Header.HeaderSize), seekStart); err != nil {
+	if _, err := sr.Seek(int64(header.Header.HeaderSize), io.SeekStart); err != nil {
 		return err
 	}
 	namespace := new(ResXMLTreeNamespaceExt)
@@ -139,12 +202,7 @@ func (f *XMLFile) readStartNamespace(sr *io.SectionReader) error {
 		f.notPrecessedNS = make(map[ResStringPoolRef]ResStringPoolRef)
 	}
 	f.notPrecessedNS[namespace.URI] = namespace.Prefix
-
-	if f.namespaces == nil {
-		f.namespaces = make(map[ResStringPoolRef]ResStringPoolRef)
-	}
-	f.namespaces[namespace.URI] = namespace.Prefix
-
+	f.namespaces.add(namespace.URI, namespace.Prefix)
 	return nil
 }
 
@@ -154,23 +212,35 @@ func (f *XMLFile) readEndNamespace(sr *io.SectionReader) error {
 		return err
 	}
 
-	if _, err := sr.Seek(int64(header.Header.HeaderSize), seekStart); err != nil {
+	if _, err := sr.Seek(int64(header.Header.HeaderSize), io.SeekStart); err != nil {
 		return err
 	}
 	namespace := new(ResXMLTreeNamespaceExt)
 	if err := binary.Read(sr, binary.LittleEndian, namespace); err != nil {
 		return err
 	}
-	delete(f.namespaces, namespace.URI)
+	f.namespaces.remove(namespace.URI)
 	return nil
 }
 
-func (f *XMLFile) addNamespacePrefix(ns, name ResStringPoolRef) string {
-	if ns != NilResStringPoolRef {
-		prefix := f.GetString(f.namespaces[ns])
-		return fmt.Sprintf("%s:%s", prefix, f.GetString(name))
+func (f *XMLFile) addNamespacePrefix(ns, name ResStringPoolRef) (string, error) {
+	if !f.HasString(name) {
+		return "", &InvalidReferenceError{Ref: name}
 	}
-	return f.GetString(name)
+
+	if ns != NilResStringPoolRef {
+		ref := f.namespaces.get(ns)
+		if ref == 0 {
+			return "", &InvalidReferenceError{Ref: ns}
+		}
+		if !f.HasString(ref) {
+			return "", &InvalidReferenceError{Ref: ref}
+		}
+		prefix := f.GetString(ref)
+
+		return fmt.Sprintf("%s:%s", prefix, f.GetString(name)), nil
+	}
+	return f.GetString(name), nil
 }
 
 func (f *XMLFile) readStartElement(sr *io.SectionReader) error {
@@ -179,7 +249,7 @@ func (f *XMLFile) readStartElement(sr *io.SectionReader) error {
 		return err
 	}
 
-	if _, err := sr.Seek(int64(header.Header.HeaderSize), seekStart); err != nil {
+	if _, err := sr.Seek(int64(header.Header.HeaderSize), io.SeekStart); err != nil {
 		return err
 	}
 	ext := new(ResXMLTreeAttrExt)
@@ -187,11 +257,22 @@ func (f *XMLFile) readStartElement(sr *io.SectionReader) error {
 		return nil
 	}
 
-	fmt.Fprintf(&f.xmlBuffer, "<%s", f.addNamespacePrefix(ext.NS, ext.Name))
+	tag, err := f.addNamespacePrefix(ext.NS, ext.Name)
+	if err != nil {
+		return err
+	}
+	f.xmlBuffer.WriteString("<")
+	f.xmlBuffer.WriteString(tag)
 
 	// output XML namespaces
 	if f.notPrecessedNS != nil {
 		for uri, prefix := range f.notPrecessedNS {
+			if !f.HasString(uri) {
+				return &InvalidReferenceError{Ref: uri}
+			}
+			if !f.HasString(prefix) {
+				return &InvalidReferenceError{Ref: prefix}
+			}
 			fmt.Fprintf(&f.xmlBuffer, " xmlns:%s=\"", f.GetString(prefix))
 			xml.Escape(&f.xmlBuffer, []byte(f.GetString(uri)))
 			fmt.Fprint(&f.xmlBuffer, "\"")
@@ -202,7 +283,7 @@ func (f *XMLFile) readStartElement(sr *io.SectionReader) error {
 	// process attributes
 	offset := int64(ext.AttributeStart + header.Header.HeaderSize)
 	for i := 0; i < int(ext.AttributeCount); i++ {
-		if _, err := sr.Seek(offset, seekStart); err != nil {
+		if _, err := sr.Seek(offset, io.SeekStart); err != nil {
 			return err
 		}
 		attr := new(ResXMLTreeAttribute)
@@ -210,6 +291,9 @@ func (f *XMLFile) readStartElement(sr *io.SectionReader) error {
 
 		var value string
 		if attr.RawValue != NilResStringPoolRef {
+			if !f.HasString(attr.RawValue) {
+				return &InvalidReferenceError{Ref: attr.RawValue}
+			}
 			value = f.GetString(attr.RawValue)
 		} else {
 			data := attr.TypedValue.Data
@@ -233,7 +317,11 @@ func (f *XMLFile) readStartElement(sr *io.SectionReader) error {
 			}
 		}
 
-		fmt.Fprintf(&f.xmlBuffer, " %s=\"", f.addNamespacePrefix(attr.NS, attr.Name))
+		name, err := f.addNamespacePrefix(attr.NS, attr.Name)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&f.xmlBuffer, " %s=\"", name)
 		xml.Escape(&f.xmlBuffer, []byte(value))
 		fmt.Fprint(&f.xmlBuffer, "\"")
 		offset += int64(ext.AttributeSize)
@@ -247,13 +335,17 @@ func (f *XMLFile) readEndElement(sr *io.SectionReader) error {
 	if err := binary.Read(sr, binary.LittleEndian, header); err != nil {
 		return err
 	}
-	if _, err := sr.Seek(int64(header.Header.HeaderSize), seekStart); err != nil {
+	if _, err := sr.Seek(int64(header.Header.HeaderSize), io.SeekStart); err != nil {
 		return err
 	}
 	ext := new(ResXMLTreeEndElementExt)
 	if err := binary.Read(sr, binary.LittleEndian, ext); err != nil {
 		return err
 	}
-	fmt.Fprintf(&f.xmlBuffer, "</%s>", f.addNamespacePrefix(ext.NS, ext.Name))
+	tag, err := f.addNamespacePrefix(ext.NS, ext.Name)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(&f.xmlBuffer, "</%s>", tag)
 	return nil
 }

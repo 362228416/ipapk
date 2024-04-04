@@ -1,7 +1,7 @@
 androidbinary
 =====
 
-[![Build Status](https://travis-ci.org/shogo82148/androidbinary.svg?branch=master)](https://travis-ci.org/shogo82148/androidbinary)
+[![Build Status](https://github.com/shogo82148/androidbinary/workflows/Test/badge.svg)](https://github.com/shogo82148/androidbinary/actions)
 [![GoDoc](https://godoc.org/github.com/shogo82148/androidbinary?status.svg)](https://godoc.org/github.com/shogo82148/androidbinary)
 
 Android binary file parser
@@ -21,12 +21,17 @@ func main() {
 	pkg, _ := apk.OpenFile("your-android-app.apk")
 	defer pkg.Close()
 
-	icon, _ := apk.Icon(nil) // returns the icon of APK as image.Image
-	pkgName := pkg.PackageName() // returns the pakcage name
+	icon, _ := pkg.Icon(nil) // returns the icon of APK as image.Image
+	pkgName := pkg.PackageName() // returns the package name
+
+	resConfigEN := &androidbinary.ResTableConfig{
+		Language: [2]uint8{uint8('e'), uint8('n')},
+	}
+	appLabel, _ = pkg.Label(resConfigEN) // get app label for en translation
 }
 ```
 
-## Low Lebel API
+## Low Level API
 
 ### Parse XML binary
 
@@ -65,7 +70,7 @@ import (
 func main() {
 	f, _ := os.Open("resources.arsc")
 	rsc, _ := androidbinary.NewTableFile(f)
-	resorce, _ := rsc.GetResource(androidbinary.ResID(0xCAFEBABE), nil)
+	resource, _ := rsc.GetResource(androidbinary.ResID(0xCAFEBABE), nil)
 	fmt.Println(resource)
 }
 ```
